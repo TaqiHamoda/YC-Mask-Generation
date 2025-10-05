@@ -1,541 +1,449 @@
 import numpy as np
-import matplotlib.pyplot as plt
-import cv2
-from sklearn.cluster import MeanShift, estimate_bandwidth
 
-import shutil
-
-from scipy.spatial import ConvexHull
-from scipy.stats.qmc import Halton
+from scipy.spatial import ConvexHull, KDTree, qhull
 from shapely.geometry import Polygon, Point
-import matplotlib.pyplot as plt
-import os
-import csv
-import random
-import glob
-from skimage.draw import polygon
+from skimage.draw import polygon as draw_polygon
 from segment_anything import sam_model_registry, SamPredictor
 import matplotlib.colors as mcolors
-import warnings
-from scipy.spatial.distance import cdist
 from scipy.spatial import KDTree
-from PIL import Image, ImageDraw
-import tqdm
-import argparse
-from sklearn.cluster import DBSCAN
+from typing import List, Tuple, Dict, Optional
 
-def generate_candidate_points(polygon_hull):
-    candidates = []
-    x_min, y_min, x_max, y_max = polygon_hull.bounds
-    for i in range(0,2000):
-        x = np.random.uniform(x_min, x_max)
-        y = np.random.uniform(y_min, y_max)
-        point = Point(x, y)
-        if polygon_hull.contains(point):
-            candidates.append(point)
-    
-    return candidates
-
-def evaluate_coverage(candidates, polygon_hull, radius):
-    scored_candidates = []
-    for point in candidates:
-        circle = point.buffer(radius)
-        intersection_area = polygon_hull.intersection(circle).area
-        scored_candidates.append((intersection_area, point))
-    
-    return sorted(scored_candidates, reverse=True, key=lambda x: x[0])
-
-def select_circle_centers(scored_candidates, n, radius):
-    selected_centers = []
-    
-    for _, point in scored_candidates:
-        if not selected_centers:  # First selection, no need to check distance
-            selected_centers.append(point)
-        else:
-            used_tree = KDTree([p.coords[0] for p in selected_centers])
-            if used_tree.query(point.coords[0], k=1, distance_upper_bound=2 * radius)[0] == np.inf:
-                selected_centers.append(point)
-
-        if len(selected_centers) >= n:
-            break
-    
-    return selected_centers
-
-def find_optimal_circle_centers(polygon, n, radius):
-    candidates = generate_candidate_points(polygon)
-    scored_candidates = evaluate_coverage(candidates, polygon, radius)
-    centers = select_circle_centers(scored_candidates, n, radius)
-    
-    return [center.coords[0] for center in centers]
+import cv2, os, csv, glob, tqdm, argparse
 
 
-def evaluate_coverage_p(candidates, points_to_cover, radius):
-    if len(points_to_cover) < 1:
-        return []
-    
-    # Convert points_to_cover into a numpy array of points (2D)
-    points_array = np.array([(p[0], p[1]) for p in points_to_cover])
-    
-    # Create the KDTree from the points
-    tree = KDTree(points_array)
-    
-    scored_candidates = []
-    for point in candidates:
-        # Query the KDTree to get indices of points within the radius
-        indices = tree.query_ball_point([point.x, point.y], radius)
-        
-        # Append the count of points within the radius and the candidate point
-        scored_candidates.append((len(indices), point))
-    
-    # Sort candidates by the number of covered points in descending order
-    return sorted(scored_candidates, reverse=True, key=lambda x: x[0])
-
-def select_circle_centers_p(scored_candidates, n, radius):
-    selected_centers = []
-    #used_tree = KDTree([])
-    
-    for count, point in scored_candidates:
-        if len(selected_centers) == 0:
-            selected_centers.append(point)
-            used_tree = KDTree([point.coords[0]])
-        else:
-            distance, _ = used_tree.query(point.coords[0], k=1, distance_upper_bound=2*radius)
-            if distance > 2 * radius:
-                selected_centers.append(point)
-                coords = [p.coords[0] for p in selected_centers]
-                used_tree = KDTree(coords)
-        if len(selected_centers) >= n:
-            break
-    return selected_centers
-
-def find_optimal_circle_centers_p(polygon, points_to_cover, n, radius):
-    candidates = generate_candidate_points(polygon)
-    scored_candidates = evaluate_coverage_p(candidates, points_to_cover, radius)
-    centers = select_circle_centers_p(scored_candidates, n, radius)
-    return [center.coords[0] for center in centers]
-
+# --- Constants ---
+# It's good practice to define constants for magic numbers.
+MIN_MASK_AREA_DEFAULT = 2000
+POINT_GENERATION_CANDIDATES = 2000
+DEFAULT_DEVICE = "cuda"
 
 class SAMInference:
-    def __init__(self,checkpoint="../sam_vit_b_01ec64.pth",model_type="vit_b",output_path='/media/vicorob/Filesystem2/YC/field_imagery/plot1_m1_250218_24mm_cc/masks'):
-        self.checkpoint = checkpoint
-        self.model_type = model_type
-        self.output_path  = output_path
+    """
+    A class to perform image segmentation using the Segment Anything Model (SAM).
+
+    This class handles the entire workflow:
+    1. Loading an image and corresponding point annotations from a CSV file.
+    2. Grouping points by their labels.
+    3. For each group, generating a convex hull to define the region of interest.
+    4. Strategically generating prompt points within this region to guide SAM.
+    5. Running SAM prediction to get a segmentation mask.
+    6. Post-processing the mask (filtering by size, applying colors).
+    7. Saving the final colored mask and an overlayed image.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        model_type: str = "vit_b",
+        output_path: str = "output/masks",
+        color_map_path: str = "color_mapping.csv",
+        device: str = DEFAULT_DEVICE,
+    ):
+        """
+        Initializes the SAMInference instance.
+
+        Args:
+            checkpoint_path (str): Path to the SAM model checkpoint file.
+            model_type (str): The type of SAM model (e.g., 'vit_b', 'vit_l', 'vit_h').
+            output_path (str): Directory to save the output masks and images.
+            color_map_path (str): Path to the CSV file for class-color mapping.
+            device (str): The device to run the model on (e.g., 'cuda', 'cpu').
+        """
+        self.output_path = output_path
+        self.color_map_path = color_map_path
+        self.min_mask_area = MIN_MASK_AREA_DEFAULT
         os.makedirs(self.output_path, exist_ok=True)
-        device = "cuda"
-        sam = sam_model_registry[self.model_type](checkpoint=self.checkpoint)
+
+        self.predictor = self._initialize_sam_model(checkpoint_path, model_type, device)
+        self.color_map = self._load_color_map()
+
+    def _initialize_sam_model(self, checkpoint: str, model_type: str, device: str) -> SamPredictor:
+        """Loads and prepares the SAM model and predictor."""
+        print(f"Initializing SAM model ({model_type}) on device '{device}'...")
+        sam = sam_model_registry[model_type](checkpoint=checkpoint)
         sam.to(device=device)
-        self.predictor = SamPredictor(sam)
-        self.color_map_path = '/media/vicorob/Filesystem3/YC/field_imagery/color_mapping.csv'
-        self.minmun_size = 2000
-        if os.path.exists(self.color_map_path):
-            map_file = open(self.color_map_path,'r')
+        return SamPredictor(sam)
+
+    def _load_color_map(self) -> Dict[str, Tuple[int, int, int]]:
+        """Loads or creates the color mapping from a CSV file."""
+        color_map = {}
+        if not os.path.exists(self.color_map_path):
+            return color_map
+            
+        with open(self.color_map_path, 'r') as map_file:
             reader = csv.reader(map_file)
-            self.color_map ={}
-            self.color_list=[]
             for row in reader:
-                class_name,hex_color = row
+                if not row: continue
+                class_name, hex_color = row
                 color = mcolors.hex2color(hex_color)
                 rgb_color = tuple(int(c * 255) for c in color)
-                self.color_map[class_name] = rgb_color
-                self.color_list.append(rgb_color)
+                color_map[class_name] = rgb_color
+        return color_map
+
+    def _get_or_create_color(self, label: str) -> Tuple[int, int, int]:
+        """
+        Retrieves a color for a given label from the color map.
+        If the label is not found, a new random color is generated and saved.
+        """
+        clean_label = label.lstrip('0')
+        if clean_label in self.color_map:
+            return self.color_map[clean_label]
+
+        # Generate a new random color if not found
+        color_array = np.random.rand(1, 3)
+        hex_color = mcolors.to_hex(color_array.ravel())
+        rgb_color = tuple(int(c * 255) for c in color_array.ravel())
+        
+        self.color_map[clean_label] = rgb_color
+
+        # Append the new color to the CSV file for future runs
+        with open(self.color_map_path, 'a+', newline='') as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow([clean_label, hex_color])
             
-        else:
-            self.color_map ={}
-            self.color_list=[]
+        return rgb_color
 
+    @staticmethod
+    def _read_annotation_file(csv_path: str) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Reads point coordinates and labels from a CSV file.
 
-    def ReadPoint(self,csv_path):
-        # f = open(txt,'r',encoding='utf-8')
-        csv_file = open(csv_path,mode='r')
-        csv_reader = csv.reader(csv_file)
-        points=[]
-        class_list=[]
-        # for line in f.readlines():
-        #     cl,x,y=line.strip().split(' ')
-        #     x = int(float(x))
-        #     y = int(float(y))
-        #     points.append([x,y])
-        #     class_list.append(cl)
-        for row in csv_reader:
-            # print(row)
-            cl,x,y = row
-            if "png" in cl:
-                continue
-            x = int(float(x))
-            y = int(float(y))
-            points.append([x,y])
-            class_list.append(cl)
-        points =np.array(points)
-        class_list =np.array(class_list)
-        return points,class_list
+        Args:
+            csv_path (str): Path to the annotation CSV file.
 
-    def Mean_shift(self,points):
-        bandwidth = estimate_bandwidth(points, quantile=0.7, n_samples=500)
-        meanshift = MeanShift(bandwidth=bandwidth,seeds=points[::500])
-        labels = meanshift.fit_predict(points)
-        centroids = meanshift.cluster_centers_
-        return labels,centroids
-
-    def MaskIOU(self,sam_mask,binary_hull_mask):
-
-        intersection = np.logical_and(sam_mask, binary_hull_mask)
-        union = np.logical_or(sam_mask, binary_hull_mask)
-        # Compute IoU
-        IOU = np.sum(intersection) / np.sum(union)
-        return IOU
-
-    def PointGenerator(self,polygon_hull,class_points=None,mode='p', num = 3 ,min_distance = 3):
-        valid_points = []
-        times = 0
-        while len(valid_points)<1:
-            x_min, y_min, x_max, y_max = polygon_hull.bounds
-            x_min = x_min 
-            y_min = y_min 
-            x_max = x_max 
-            y_max = y_max 
-            # Halton
-            #halton_sampler = Halton(d=2,optimization='lloyd')
-            #halton_points = halton_sampler.random(5 * 2)
-            #halton_points[:, 0] = halton_points[:, 0] * (x_max - x_min) + x_min
-            #halton_points[:, 1] = halton_points[:, 1] * (y_max - y_min) + y_min
-
-            #for point in halton_points:
-            #    point_obj = Point(point)
-            #    if polygon_hull.contains(point_obj) and polygon_hull.exterior.distance(point_obj) > min_distance:
-            #        valid_points.append(point)
-
-
-            #Maximin
-            #x_min, y_min, x_max, y_max = polygon_hull.bounds
-            #candidates = []
-            #num_candidates = 1000
-            #while len(candidates) < num_candidates:
-            #    x = np.random.uniform(x_min+30, x_max-20)
-            #    y = np.random.uniform(y_min+30, y_max-20)
-            #    point = Point(x, y)
-            #    if polygon_hull.contains(point):
-            #        candidates.append([x, y])
-            
-            #candidates = np.array(candidates)
-            #sampled_points = [candidates[np.random.randint(len(candidates))]] 
-            #num_samples = 3
-            #for _ in range(num_samples - 1):
-            
-             #   distances = cdist(candidates, np.array(sampled_points))  
-             #   min_distances = np.min(distances, axis=1)  
-                
-
-              #  best_idx = np.argmax(min_distances)
-              #  sampled_points.append(candidates[best_idx])
-              #  valid_points.append(candidates[best_idx])
-            
-            #Circle cover
-            #print(polygon_hull.area)
-            if polygon_hull.area >1000000:
-                radius = 150  # Circle radius
-                n =8
-            elif polygon_hull.area >500000:
-                n =5
-                radius = 150  # Circle radius
-            elif polygon_hull.area >100000:
-                n =3
-                radius = 100  # Circle radius
-            else :
-                n=2
-                radius = 90  # Circle radius
-             ## Number of circles
-            
-            #print(f'n:{n}')
-            if mode == 'p':
-                valid_points = find_optimal_circle_centers_p(polygon_hull,class_points, n, radius)
-            else:
-                 valid_points = find_optimal_circle_centers(polygon_hull, n, radius)
-            times +=1
-            if times>10:
-              return None
-        #valid_points = valid_points[:num]
-        return valid_points
-
-    def Inference(self,txt):
-        image_path =txt.replace('.csv','.JPG').replace('annotations','images')
-        print(image_path)
-        if not os.path.exists(image_path):
-            print("Image not exists")
-            return None
-        points,labels =self.ReadPoint(txt)
-        # labels,_ = self.Mean_shift(points)
-        unique_labels = np.unique(labels)
-        masks_total = []
-        scores_total = []
-        color_total = []
-        label_total = []
-        ori_image = cv2.imread(image_path)
-        draw_img= Image.open(image_path)
-        draw = ImageDraw.Draw(draw_img)
-        for pt in points:
-            x,y = pt
-            x, y = map(int, (x,y))
-            draw.ellipse((x - 10, y - 10, x + 10, y + 10),fill=(255,255,0))
-        image = cv2.cvtColor(ori_image, cv2.COLOR_BGR2RGB)
-        self.predictor.set_image(image)
-        for label in unique_labels:
-            if 'chain'in label or 'scale'in label:
-                mode = 'p'
-                IOU_t = 0.1
-            else:
-                mode = 'l'
-                IOU_t = 0.5
-            
-            class_points = points[labels == label]
-            if class_points.shape[0]==0:
-                continue
-           
-            # label_index = int(label)
-            binary_hull_mask = None
-            # class_point_s = np.squeeze(class_points)
-            # clustering = DBSCAN(eps=5, min_samples=5).fit(class_point_s)
-            # labels = clustering.labels_
-            # class_points = class_points[labels != -1] 
-            # if len(class_points)<5:
-            #     continue
-            
-            class_points=np.unique(class_points, axis=0)
-            point_list = None
-            try:
-              
-                hull = ConvexHull(class_points)
-                hull_vertices = class_points[hull.vertices]
-                polygon_hull = Polygon(hull_vertices)
-                polygon_points = [tuple(point) for point in hull_vertices]
-                
-                draw.polygon(polygon_points, outline="green", width=13) 
-
-                mask_shape = image.shape[:2]
-                binary_hull_mask = np.zeros(mask_shape, dtype=np.uint8)
-                polygon_coords = np.array(polygon_hull.exterior.coords)
-                rr, cc = polygon(polygon_coords[:, 1], polygon_coords[:, 0], shape=mask_shape)
-
-                # Mark the polygon area in the binary mask
-                binary_hull_mask[rr, cc] = 1
-
-                # plt.figure(figsize=(8, 8))
-                # plt.imshow(binary_hull_mask)
-                # plt.title("binary_hull_mask")
-                # plt.axis('off')
-                # plt.show()
-
-                point_list = self.PointGenerator(polygon_hull,class_points,mode=mode)
-            except:
-                print(len(class_points))
-                if(len(class_points)<3):
+        Returns:
+            A tuple containing:
+            - np.ndarray: An array of (x, y) point coordinates.
+            - np.ndarray: An array of corresponding string labels.
+        """
+        points, class_list = [], []
+        with open(csv_path, mode='r') as csv_file:
+            reader = csv.reader(csv_file)
+            for row in reader:
+                if not row or "png" in row[0]: # Skip header or irrelevant rows
                     continue
-                try:
-                   point_list = random.sample(class_points, 1)  
-                except:
-                   continue
-            #print(f'point:{point_list}')
-            if point_list is None:
+                label, x, y = row
+                points.append([int(float(x)), int(float(y))])
+                class_list.append(label)
+        return np.array(points), np.array(class_list)
+
+    @staticmethod
+    def _generate_candidate_points(polygon: Polygon, num_points: int) -> List[Point]:
+        """Generates random candidate points within the bounding box of a polygon."""
+        candidates = []
+        min_x, min_y, max_x, max_y = polygon.bounds
+        for _ in range(num_points):
+            x = np.random.uniform(min_x, max_x)
+            y = np.random.uniform(min_y, max_y)
+            point = Point(x, y)
+            if polygon.contains(point):
+                candidates.append(point)
+        return candidates
+
+    def _generate_sam_prompts(
+        self,
+        polygon: Polygon,
+        class_points: Optional[np.ndarray] = None,
+        mode: str = 'p'
+    ) -> List[Tuple[float, float]]:
+        """
+        Generates optimal prompt points for SAM using a circle-packing approach.
+
+        This method aims to find a set of N circle centers that maximally cover
+        the area of the polygon ('l' mode) or the provided class_points ('p' mode).
+
+        Args:
+            polygon (Polygon): The geometric area (convex hull) to generate points in.
+            class_points (np.ndarray, optional): The original points to be covered.
+                                                Required for 'p' (point) mode.
+            mode (str): 'p' for point-based coverage, 'l' for area-based coverage.
+
+        Returns:
+            A list of (x, y) coordinates for the selected prompt points.
+        """
+        area = polygon.area
+        if area > 1_000_000:
+            n_circles, radius = 8, 150
+        elif area > 500_000:
+            n_circles, radius = 5, 150
+        elif area > 100_000:
+            n_circles, radius = 3, 100
+        else:
+            n_circles, radius = 2, 90
+        
+        candidates = self._generate_candidate_points(polygon, POINT_GENERATION_CANDIDATES)
+        if not candidates:
+            return []
+
+        if mode == 'p' and class_points is not None and len(class_points) > 0:
+            # Score candidates based on how many class_points they cover
+            kdtree = KDTree(class_points)
+            scored_candidates = []
+            for point in candidates:
+                indices = kdtree.query_ball_point([point.x, point.y], radius)
+                scored_candidates.append((len(indices), point))
+        else:
+            # Score candidates based on how much of their circle area is inside the polygon
+            scored_candidates = []
+            for point in candidates:
+                circle = point.buffer(radius)
+                intersection_area = polygon.intersection(circle).area
+                scored_candidates.append((intersection_area, point))
+        
+        # Sort candidates by score (descending)
+        scored_candidates.sort(reverse=True, key=lambda x: x[0])
+
+        # Select N centers that are well-separated
+        selected_centers = []
+        min_dist_between_centers = 2 * radius
+
+        for _, point in scored_candidates:
+            if not selected_centers:
+                selected_centers.append(point)
                 continue
             
-            for prompt in point_list:
-                x,y = prompt
-                x, y = map(int, (x,y))
+            # Check distance to already selected centers
+            is_far_enough = True
+            for center in selected_centers:
+                if point.distance(center) < min_dist_between_centers:
+                    is_far_enough = False
+                    break
             
-                draw.ellipse((x - 20, y - 20, x + 20, y + 20),fill=(0,255,255))
-                #print('draw')
+            if is_far_enough:
+                selected_centers.append(point)
 
+            if len(selected_centers) >= n_circles:
+                break
+        
+        return [center.coords[0] for center in selected_centers]
+
+    def _process_object_group(
+        self,
+        points_group: np.ndarray,
+        label: str,
+        image_shape: Tuple[int, int]
+    ) -> Optional[Tuple[np.ndarray, Tuple[int, int, int]]]:
+        """
+        Processes a single group of points belonging to the same object class.
+
+        This involves creating a convex hull, generating SAM prompts, running
+        prediction, and returning the resulting mask and color.
+
+        Returns:
+            A tuple of (mask, color) or None if processing fails.
+        """
+        unique_points = np.unique(points_group, axis=0)
+        if len(unique_points) < 3:
+            return None # Not enough points to form a polygon
+
+        try:
+            hull = ConvexHull(unique_points)
+            hull_vertices = unique_points[hull.vertices]
+            polygon = Polygon(hull_vertices)
+
+            # Create a binary mask from the convex hull for IOU calculation
+            binary_hull_mask = np.zeros(image_shape, dtype=np.uint8)
+            poly_coords = np.array(polygon.exterior.coords)
+            rr, cc = draw_polygon(poly_coords[:, 1], poly_coords[:, 0], shape=image_shape)
+            binary_hull_mask[rr, cc] = 1
+
+            # Determine mode for point generation
+            mode = 'p' if 'chain' in label or 'scale' in label else 'l'
+            prompt_points = self._generate_sam_prompts(polygon, unique_points, mode=mode)
             
+            if not prompt_points:
+                return None
 
-
-            label_list = [1]*len(point_list)
-            input_point = np.array(point_list)
-            input_label = np.array(label_list)
-            sam_mask, scores, logits = self.predictor.predict(
-            point_coords=input_point,
-            point_labels=input_label,
-            multimask_output=False,)
-            if label.lstrip('0') not in self.color_map.keys():
-                colors = np.random.rand(1,3)
-                hex_color = mcolors.to_hex(colors) 
-
-                color = mcolors.hex2color(hex_color)
-                with open(self.color_map_path,mode='a+',newline='') as csv_file:
-                    colorwriter = csv.writer(csv_file)
-                    colorwriter.writerow([str(label.lstrip('0')),str(hex_color)])
-                rgb_color = tuple(int(c * 255) for c in color)
-                self.color_map[label.lstrip('0')] = rgb_color
-                self.color_list.append(rgb_color)
+            # Run SAM prediction
+            input_points = np.array(prompt_points)
+            input_labels = np.ones(len(prompt_points), dtype=int)
             
-            if binary_hull_mask is not None:
-              IOU = self.MaskIOU(sam_mask,binary_hull_mask)
-              
+            sam_mask, scores, _ = self.predictor.predict(
+                point_coords=input_points,
+                point_labels=input_labels,
+                multimask_output=False,
+            )
 
-              if IOU>0.2:
-                #print(f'IOU:{IOU:.2f}')
+            # Check Intersection over Union (IoU) between SAM mask and hull mask
+            intersection = np.logical_and(sam_mask, binary_hull_mask)
+            union = np.logical_or(sam_mask, binary_hull_mask)
+            iou = np.sum(intersection) / np.sum(union)
+            
+            # If IoU is high, refine the SAM mask by constraining it to a dilated hull area
+            if iou > 0.2:
                 kernel = np.ones((5, 5), np.uint8)
-                dilated_mask = cv2.dilate(binary_hull_mask, kernel, iterations=50)
-                sam_mask = np.logical_and(sam_mask, dilated_mask)
-                #sam_mask = dilated_mask
-                masks_total.append(sam_mask)
-                scores_total.append(scores)
-                # current_color = self.color_list[label_index]
-                current_color = self.color_map[label.lstrip('0')]
-                color_total.append(current_color)
-                # print(current_color)
-                colored_mask = np.zeros((*mask_shape, 3), dtype=np.uint8)
-                sam_mask = sam_mask.squeeze()
-                
- 
-                for c in range(3):  # For each channel in RGB
-                    colored_mask[:, :, c] += (sam_mask.astype(np.uint8) * current_color[c])
-                
-                # plt.figure(figsize=(10,10))
-                # plt.imshow(colored_mask)
-                # # # show_mask(masks, plt.gca())
-                # # show_points(input_point, input_label, plt.gca())
-                # plt.axis('off')
-                # # name = name.replace('_marked.jpg','_vit_b.jpg')
-                # # plt.savefig(os.path.join(output_path, name), bbox_inches='tight', pad_inches=0)
-                # plt.show()
+                dilated_hull = cv2.dilate(binary_hull_mask, kernel, iterations=50)
+                sam_mask = np.logical_and(sam_mask, dilated_hull)
 
-            else:
-              masks_total.append(sam_mask)
-              scores_total.append(scores)
-              current_color = self.color_map[label.lstrip('0')]
-              color_total.append(current_color)
-              #print(current_color)
-              colored_mask = np.zeros((*mask_shape, 3), dtype=np.uint8)
-              sam_mask = sam_mask.squeeze()
-              num_labels, labels_m, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8))
-              min_size = 20000
-              filtered_mask = np.zeros_like(sam_mask)
-              for label_m in range(1, num_labels):  # 从1开始，0是背景
-                if stats[label_m, cv2.CC_STAT_AREA] >= min_size:
-                    filtered_mask[labels_m == label_m] = 255
-              for i in range(0,50,3):
-                    kernel = np.ones((i, i), np.uint8)  
-                    filled_mask = cv2.morphologyEx(filtered_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+            color = self._get_or_create_color(label)
+            return sam_mask, color
 
-              for c in range(3):  # For each channel in RGB
-                colored_mask[:, :, c] += (filled_mask.astype(np.uint8) * current_color[c])
-        # print(f'masks_total:{len(masks_total)}')
-        if len(masks_total)==1:
-            mask = masks_total[0]
-            mask =mask.squeeze()
-            color = color_total[0]
-            colored_mask = np.zeros((*mask_shape, 3), dtype=np.uint8)
-                # print(color)
-                # Apply the mask to each color channel (R, G, B)s
-            num_labels, labels_m, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8))
-            min_size = self.minmun_size
-            filtered_mask = np.zeros_like(mask)
-            for label_m in range(1, num_labels):  # 从1开始，0是背景
-                #print(f'size:{stats[label_m, cv2.CC_STAT_AREA]}')
-                if stats[label_m, cv2.CC_STAT_AREA] >= min_size:
-                    filtered_mask[labels_m == label_m] = 255
-            for i in range(0,50,3):
-                kernel = np.ones((i, i), np.uint8)  
-                filled_mask = cv2.morphologyEx(filtered_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+        except (qhull.QhullError, ValueError) as e:
+            print(f"  - Could not process group '{label}': {e}")
+            return None
+
+    def _filter_and_color_mask(
+        self, 
+        mask: np.ndarray, 
+        color: Tuple[int, int, int], 
+        image_shape: Tuple[int, int, int]
+    ) -> np.ndarray:
+        """
+        Filters a binary mask to remove small components and applies color.
+        
+        Args:
+            mask (np.ndarray): The input binary mask.
+            color (tuple): The RGB color to apply.
+            image_shape (tuple): The shape of the final colored mask (H, W, C).
+        
+        Returns:
+            np.ndarray: The colored and filtered mask.
+        """
+        mask_uint8 = mask.squeeze().astype(np.uint8)
+        
+        # Find connected components and filter by area
+        num_labels, labels_map, stats, _ = cv2.connectedComponentsWithStats(mask_uint8)
+        filtered_mask = np.zeros_like(mask_uint8)
+        for i in range(1, num_labels): # Start from 1 to skip background
+            if stats[i, cv2.CC_STAT_AREA] >= self.min_mask_area:
+                filtered_mask[labels_map == i] = 1 # Use 1 for logical operations
+        
+        # Apply morphological closing to fill holes
+        kernel = np.ones((15, 15), np.uint8)
+        filled_mask = cv2.morphologyEx(filtered_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Apply color
+        colored_mask_part = np.zeros(image_shape, dtype=np.uint8)
+        for c in range(3):
+            colored_mask_part[:, :, c] = filled_mask * color[c]
             
-            for c in range(3):  # For each channel in RGB
-                colored_mask[:, :, c] += (filled_mask.astype(np.uint8) * color[c])
-            output_name = os.path.join(self.output_path,os.path.basename(image_path).replace('.jpg','.png'))
-            cv2.imwrite(output_name,colored_mask)
-            alpha = 0.6  # transparency factor for the mask overlay
-            overlayed_image = cv2.addWeighted(image, 1, colored_mask, alpha, 0)
+        return colored_mask_part
 
-            # Plotting the original image with the mask overlay
-            output_name_mask = os.path.join(self.output_path,os.path.basename(image_path).replace('.jpg','_mask.jpg'))
-            cv2.imwrite(output_name_mask,overlayed_image)
-            output_image_path = os.path.join(self.output_path,os.path.basename(image_path).replace('.jpg','_pts.jpg'))
-            #print(output_image_path)
-            draw_img.save(output_image_path)
+    def process_image(self, annotation_path: str):
+        """
+        Main processing function for a single image and its annotation file.
 
+        Args:
+            annotation_path (str): Path to the annotation CSV file.
+        """
+        image_path = annotation_path.replace('.csv', '.JPG').replace('annotations', 'images')
+        print(f"\nProcessing: {os.path.basename(image_path)}")
 
-        elif len(masks_total)>1:
-          
-          mask_shape = masks_total[0].squeeze().shape  # Get the height and width of a single mask
-          colored_mask = np.zeros((*mask_shape, 3), dtype=np.uint8)  # RGB mask with shape (682, 1024, 3)
+        if not os.path.exists(image_path):
+            print(f"  - Image not found at: {image_path}")
+            return
+            
+        original_image = cv2.imread(image_path)
+        if original_image is None:
+            print(f"  - Failed to read image: {image_path}")
+            return
+        
+        image_rgb = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+        self.predictor.set_image(image_rgb)
+        
+        image_points, image_labels = self._read_annotation_file(annotation_path)
+        if image_points.size == 0:
+            print("  - No points found in annotation file.")
+            return
 
-          # Use colormap or manually define colors
-          #colors = [np.array([random.randint(0, 255) for _ in range(3)]) for _ in range(len(masks_total))]
+        all_masks, all_colors = [], []
+        unique_labels = np.unique(image_labels)
 
-          # Combine masks and apply colors
-          for i, mask in enumerate(masks_total):
-                mask = mask.squeeze()  # Ensure mask is 2D (height x width)
-                color = color_total[i]
-                # print(color)
-                # Apply the mask to each color channel (R, G, B)s
-                num_labels, labels_m, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8))
-                min_size = self.minmun_size
-                filtered_mask = np.zeros_like(mask)
-                for label_m in range(1, num_labels):  # 从1开始，0是背景
-                    # print(f'size:{stats[label_m, cv2.CC_STAT_AREA]}')
-                    if stats[label_m, cv2.CC_STAT_AREA] >= min_size:
-                        filtered_mask[labels_m == label_m] = 255
-                for i in range(0,50,3):
-                    kernel = np.ones((i, i), np.uint8)  
-                    filled_mask = cv2.morphologyEx(filtered_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-                
-                for c in range(3):  # For each channel in RGB
-                    colored_mask[:, :, c] += (filled_mask.astype(np.uint8) * color[c])
+        for label in unique_labels:
+            class_points = image_points[image_labels == label]
+            result = self._process_object_group(class_points, label, image_rgb.shape[:2])
+            if result:
+                mask, color = result
+                all_masks.append(mask)
+                all_colors.append(color)
 
-          output_name = os.path.join(self.output_path,os.path.basename(image_path).replace('.jpg','.png').replace('.JPG','.png'))
-          cv2.imwrite(output_name,colored_mask)
-          alpha = 0.6  # transparency factor for the mask overlay
-          overlayed_image = cv2.addWeighted(image, 1, colored_mask, alpha, 0)
+        if not all_masks:
+            print("  - No valid masks were generated for this image.")
+            return
 
-          # Plotting the original image with the mask overlay
-          #output_name_mask = os.path.join(self.output_path,os.path.basename(image_path).replace('.jpg','_mask.jpg').replace('.JPG','_mask.jpg'))
-          #cv2.imwrite(output_name_mask,overlayed_image)
-          #print(output_name_mask)
+        # Combine all processed masks into a single colored image
+        final_colored_mask = np.zeros_like(image_rgb)
+        for mask, color in zip(all_masks, all_colors):
+            colored_part = self._filter_and_color_mask(mask, color, image_rgb.shape)
+            final_colored_mask = cv2.add(final_colored_mask, colored_part)
 
-          #output_image_path = os.path.join(self.output_path,os.path.basename(image_path).replace('.jpg','_pts.jpg').replace('.JPG','_pts.jpg'))
-          #print(output_image_path)
-          #draw_img.save(output_image_path)
+        # --- Save Outputs ---
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
+        
+        # 1. Save the final colored mask (PNG with transparency)
+        output_mask_path = os.path.join(self.output_path, f"{base_name}.png")
+        # To save with transparency, we need an alpha channel
+        mask_alpha = (final_colored_mask.max(axis=2) > 0).astype(np.uint8) * 255
+        mask_bgra = cv2.cvtColor(final_colored_mask, cv2.COLOR_RGB2BGRA)
+        mask_bgra[:, :, 3] = mask_alpha
+        cv2.imwrite(output_mask_path, mask_bgra)
 
-        #   output_image_path = os.path.join(self.output_path,os.path.basename(image_path).replace('.jpg','_pts.jpg').replace('.JPG','_ori.jpg'))
-        #   shutil.copyfile(image_path,output_image_path)
-         
-          # Plotting the colored masks
-          # alpha = 0.6  # transparency factor for the mask overlay
-          # overlayed_image = cv2.addWeighted(image, 1, colored_mask, alpha, 0)
+        # 2. Save the overlay image
+        output_overlay_path = os.path.join(self.output_path, f"{base_name}_overlay.jpg")
+        overlay = cv2.addWeighted(image_rgb, 1, final_colored_mask, 0.6, 0)
+        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(output_overlay_path, overlay_bgr)
+        
+        print(f"  - Successfully saved outputs to {self.output_path}")
 
-          # # Plotting the original image with the mask overlay
-          # plt.figure(figsize=(8, 8))
-          # plt.imshow(overlayed_image)
-          # plt.title("output")
-          # plt.axis('off')
-          # plt.show()
-
-
-# if __name__ == "__main__":
-#     warnings.simplefilter("ignore", category=FutureWarning)
-#     Infer = SAMInference()
-    
-#     # txts = ['/media/vicorob/Filesystem2/YC/field_imagery/plot2/annotations_plot2/IMG_9065.csv']
-#     txts = glob.glob('/media/vicorob/Filesystem2/YC/field_imagery/plot1_m1_250218_24mm_cc/annotations/*.csv')
-#     print(f'total:{len(txts)}')
-    
-#     for txt in txts:
-#         print(txt)
-#         Infer.Inference(txt)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Process seedpoint annotations.')
-    parser.add_argument('--input_folder', type=str, required=True,
-                        help='Path to the input seedpoints CSV file.')
-
+    parser = argparse.ArgumentParser(
+        description="Run SAM inference on a folder of images with point annotations.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        '--input_folder', 
+        type=str, 
+        required=True,
+        help='Path to the root folder containing "images" and "annotations" subdirectories.'
+    )
+    parser.add_argument(
+        '--checkpoint', 
+        type=str, 
+        default="../sam_vit_b_01ec64.pth",
+        help='Path to the SAM model checkpoint file.'
+    )
+    parser.add_argument(
+        '--model_type', 
+        type=str, 
+        default="vit_b",
+        help='SAM model type (e.g., "vit_b", "vit_l", "vit_h").'
+    )
+    parser.add_argument(
+        '--output_folder',
+        type=str,
+        default=None,
+        help='Path to the output folder. Defaults to "masks" inside the input folder.'
+    )
 
     args = parser.parse_args()
-    output_path = os.path.join(args.input_folder,'masks')  
-    os.makedirs(output_path,exist_ok=True)
-    Infer = SAMInference(output_path=output_path)
-    csv_folder = os.path.join(args.input_folder,'annotations') 
-    # txts = ['/media/vicorob/Filesystem2/YC/field_imagery/plot2/annotations_plot2/IMG_9065.csv']
-    txts = glob.glob(csv_folder+'/*.csv')
-    print(f'total:{len(txts)}')
+
+    # Define paths
+    output_path = args.output_folder or os.path.join(args.input_folder, 'masks')
+    annotations_folder = os.path.join(args.input_folder, 'annotations')
+    color_map_path = os.path.join(output_path, 'color_mapping.csv')
+
+    # Check if checkpoint exists
+    if not os.path.exists(args.checkpoint):
+        print(f"Error: Model checkpoint not found at '{args.checkpoint}'")
+        exit()
+
+    # Initialize the inference engine
+    infer = SAMInference(
+        checkpoint_path=args.checkpoint,
+        model_type=args.model_type,
+        output_path=output_path,
+        color_map_path=color_map_path
+    )
+
+    # Find all annotation files and process them
+    annotation_files = glob.glob(os.path.join(annotations_folder, '*.csv'))
+    print(f'Found {len(annotation_files)} annotation files to process.')
     
-    for txt in tqdm.tqdm(txts):
-    #    print(txt)
-        Infer.Inference(txt)
+    if not annotation_files:
+        print(f"Warning: No .csv files found in '{annotations_folder}'")
+        exit()
+
+    for ann_file in tqdm(annotation_files, desc="Processing images"):
+        infer.process_image(ann_file)
