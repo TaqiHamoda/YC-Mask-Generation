@@ -1,0 +1,15 @@
+default_device: cuda
+model_type: vit_b  # Choices are (vit_b, vit_l, vit_h)
+min_mask_area_default: 2000
+point_generation_candidates: 2000
+
+annotations_file: annotations.csv
+colormap_file: colormap.csv
+images_dir: images/
+checkpoint_file: checkpoint.pth
+output_dir: masks/
+
+dirs:
+- dir1/
+- dir2/
+- dir3/

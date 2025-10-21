@@ -1,6 +1,6 @@
 import csv
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 
 class Annotations:

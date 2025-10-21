@@ -1,13 +1,10 @@
 import numpy as np
-import cv2, os, tqdm, argparse
-from typing import Dict, List, Tuple, Optional
+import cv2, os, tqdm, gc, yaml
+from typing import Tuple
 
 from .annotations import Annotations
+from .colormap import Colormap
 from .SAMInference import SAMInference
-
-DEFAULT_DEVICE = "cuda"
-MIN_MASK_AREA_DEFAULT = 2000
-POINT_GENERATION_CANDIDATES = 2000
 
 
 def filter_and_color_mask(
@@ -49,105 +46,84 @@ def filter_and_color_mask(
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description="Run SAM inference on a folder of images with point annotations.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument(
-        '--annotations_path', 
-        type=str, 
-        required=True,
-        help='Path to the root folder containing "images" and "annotations" subdirectories.'
-    )
-    parser.add_argument(
-        '--images_path', 
-        type=str, 
-        required=True,
-        help='Path to the root folder containing "images" and "annotations" subdirectories.'
-    )
-    parser.add_argument(
-        '--checkpoint_path', 
-        type=str, 
-        default="../sam_vit_b_01ec64.pth",
-        help='Path to the SAM model checkpoint file.'
-    )
-    parser.add_argument(
-        '--model_type', 
-        type=str, 
-        default="vit_b",
-        help='SAM model type (e.g., "vit_b", "vit_l", "vit_h").'
-    )
-    parser.add_argument(
-        '--output_path',
-        type=str,
-        default=None,
-        help='Path to the output folder. Defaults to "masks" inside the input folder.'
-    )
-
-    args = parser.parse_args()
-
-    # Check if checkpoint exists
-    if not os.path.exists(args.checkpoint):
-        print(f"Error: Model checkpoint not found at '{args.checkpoint}'")
+    # 💡 Load Configuration from YAML
+    try:
+        with open('config.yaml', 'r') as f:
+            config = yaml.safe_load(f)
+    except Exception as e:
+        print(f"Error loading config file 'config.yaml': {e}")
         exit()
 
-    # Initialize the inference engine
-    sam_model = SAMInference(
-        checkpoint_path=args.checkpoint,
-        color_map=color_map,
-        model_type=args.model_type,
-        device=DEFAULT_DEVICE,
-        point_generation_candidates=POINT_GENERATION_CANDIDATES
-    )
+    # Get values from config (or use sensible defaults if not in config)
+    default_device = config.get('default_device', 'cuda')
+    model_type = config.get('model_type', 'vit_b')
+    min_mask_area_default = config.get('min_mask_area_default', 2000)
+    point_generation_candidates = config.get('point_generation_candidates', 2000)
+    annotations_file = config.get('annotations_file', 'annotations.csv')
+    colormap_file = config.get('colormap_file', 'colormap.csv')
+    images_dir = config.get('images_dir', 'images/')
+    checkpoint_file = config.get('checkpoint_file', 'checkpoint.pth')
+    output_dir = config.get('output_dir', 'masks/')
 
-    annotations = Annotations(annotation_path)
-    for image_name in tqdm(tuple(annotations.data.values())):
-        if not os.path.exists(f"{images_dir}/{image_name}") or not os.path.isfile(f"{images_dir}/{image_name}"):
-            print(f"Image {image_name} not found.")
-            continue
+    dirs = config.get('dirs', [])
 
-        image = cv2.imread(f"{images_dir}/{image_name}", cv2.IMREAD_COLOR_RGB)
+    for d in dirs:
+        # 💡 Create output directory if it doesn't exist
+        os.makedirs(f"{d}/{output_dir}", exist_ok=True)
 
-        image_points, image_labels = annotations.data[image_name]
-        if image_points.size == 0:
-            print("  - No points found in annotation file.")
-            exit()
+        # Initialize the inference engine
+        sam_model = SAMInference(
+            checkpoint_path=f"{d}/{checkpoint_file}",
+            color_map=Colormap(f"{d}/{colormap_file}"),
+            model_type=model_type,
+            device=default_device,
+            point_generation_candidates=point_generation_candidates
+        )
 
-        all_masks, all_colors = [], []
-        unique_labels = np.unique(image_labels)
-
-        for label in unique_labels:
-            class_points = image_points[image_labels == label]
-            result = sam_model.process_object_group(image, class_points, label, image.shape[:2])
-            if result:
-                mask, color = result
-                all_masks.append(mask)
-                all_colors.append(color)
-
-        if not all_masks:
-            print("  - No valid masks were generated for this image.")
-            exit()
-
-        # Combine all processed masks into a single colored image
-        final_colored_mask = np.zeros_like(image)
-        for mask, color in zip(all_masks, all_colors):
-            colored_part = filter_and_color_mask(mask, color, image.shape, MIN_MASK_AREA_DEFAULT)
-            final_colored_mask = cv2.add(final_colored_mask, colored_part)
-
-        # --- Save Outputs ---
+        # 💡 Initialize Annotations using the config path
+        annotations = Annotations(annotations_file)
         
-        # 1. Save the final colored mask (PNG with transparency)
-        output_mask_path = os.path.join(output_path, f"{image_name}_color.png")
-        # To save with transparency, we need an alpha channel
-        mask_alpha = (final_colored_mask.max(axis=2) > 0).astype(np.uint8) * 255
-        mask_bgra = cv2.cvtColor(final_colored_mask, cv2.COLOR_RGB2BGRA)
-        mask_bgra[:, :, 3] = mask_alpha
-        cv2.imwrite(output_mask_path, mask_bgra)
+        # 💡 Fix the iteration: use keys (image_name) instead of values
+        for image_name in tqdm.tqdm(annotations.data.keys()):
+            image_path = f"{d}/{images_dir}/{image_name}"
+            if not os.path.exists(image_path) or not os.path.isfile(image_path):
+                print(f"Image {image_name} not found.")
+                continue
 
-        # 2. Save the overlay image
-        output_overlay_path = os.path.join(output_path, f"{image_name}_overlay.jpg")
-        overlay = cv2.addWeighted(image, 1, final_colored_mask, 0.6, 0)
-        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(output_overlay_path, overlay_bgr)
-        
-        print(f"  - Successfully saved outputs to {output_path}")
+            image = cv2.imread(image_path, cv2.IMREAD_COLOR) 
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            image_labels, image_points = annotations.data[image_name]
+            if image_points.size == 0:
+                print("  - No points found in annotation file.")
+                continue
+
+            mask = np.zeros_like(image)
+            for label in np.unique(image_labels):
+                class_points = image_points[image_labels == label]
+                result = sam_model.process_object_group(image, class_points, label, image.shape[:2])
+                if result is None:
+                    continue
+
+                m, c = result
+                colored_part = filter_and_color_mask(m, c, image.shape, min_mask_area_default)
+                mask = cv2.add(mask, colored_part)
+
+                del m, c, result
+
+            if np.all(mask == 0):
+                print(f"No valid masks were generated for image {image_name}.")
+                continue
+
+            cv2.imwrite(
+                f"{d}/{output_dir}/{image_name.split('.')[:-1]}_color.png",
+                cv2.cvtColor(mask, cv2.COLOR_RGB2BGR)
+            )
+
+            cv2.imwrite(
+                f"{d}/{output_dir}/{image_name.split('.')[:-1]}_overlay.png",
+                cv2.cvtColor(cv2.addWeighted(image, 1, mask, 0.6, 0), cv2.COLOR_RGB2BGR)
+            )
+
+        del annotations, sam_model, image
+        gc.collect()

@@ -4,7 +4,9 @@ from shapely.geometry import Polygon, Point
 from skimage.draw import polygon as draw_polygon
 from segment_anything import sam_model_registry, SamPredictor
 from scipy.spatial import KDTree
-from typing import Dict, List, Tuple, Optional
+from typing import List, Tuple, Optional
+
+from .colormap import Colormap
 
 
 class SAMInference:
@@ -24,7 +26,7 @@ class SAMInference:
     def __init__(
         self,
         checkpoint_path: str,
-        color_map: Dict[str, Tuple[int, int, int]],
+        colormap: Colormap,
         model_type: str = 'vit_b',
         device: str = 'cuda',
         point_generation_candidates: int = 2000,
@@ -36,10 +38,10 @@ class SAMInference:
             checkpoint_path (str): Path to the SAM model checkpoint file.
             model_type (str): The type of SAM model (e.g., 'vit_b', 'vit_l', 'vit_h').
             output_path (str): Directory to save the output masks and images.
-            color_map (Dict[str, Tuple[int, int, int]]): Color map from class to RGB.
+            colormap (Colormap): Color map from class to BGR.
             device (str): The device to run the model on (e.g., 'cuda', 'cpu').
         """
-        self.color_map = color_map
+        self.colormap = colormap
         self.point_generation_candidates = point_generation_candidates
 
         print(f"Initializing SAM model ({model_type}) on device '{device}'...")
@@ -48,7 +50,7 @@ class SAMInference:
 
         self.predictor = SamPredictor(sam)
 
-    def _generate_sam_prompts(
+    def generate_sam_prompts(
         self,
         polygon: Polygon,
         class_points: Optional[np.ndarray] = None,
@@ -133,13 +135,6 @@ class SAMInference:
         
         return [center.coords[0] for center in selected_centers]
 
-    def _get_or_create_color(self, label) -> Tuple[int, int, int]:
-        if self.color_map.get(label) is None:
-            self.color_map[label] = tuple(np.random.randint(0, 255, (3,)))
-            print(f"Class label {label} has no assigned color so {self.color_map[label]} has been assigned to it")
-
-        return self.color_map[label]
-
     def process_object_group(
         self,
         image: np.ndarray,
@@ -175,8 +170,7 @@ class SAMInference:
 
             # Determine mode for point generation
             mode = 'p' if 'chain' in label or 'scale' in label else 'l'
-            prompt_points = self._generate_sam_prompts(polygon, unique_points, mode=mode)
-            
+            prompt_points = self.generate_sam_prompts(polygon, unique_points, mode=mode)
             if not prompt_points:
                 return None
 
@@ -201,8 +195,7 @@ class SAMInference:
                 dilated_hull = cv2.dilate(binary_hull_mask, kernel, iterations=50)
                 sam_mask = np.logical_and(sam_mask, dilated_hull)
 
-            color = self._get_or_create_color(label)
-            return sam_mask, color
+            return sam_mask, self.colormap.getColor(label)
         except (qhull.QhullError, ValueError) as e:
             print(f"  - Could not process group '{label}': {e}")
             return None
