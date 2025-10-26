@@ -6,7 +6,7 @@ from segment_anything import sam_model_registry, SamPredictor
 from scipy.spatial import KDTree
 from typing import List, Tuple, Optional
 
-from .colormap import Colormap
+from colormap import Colormap
 
 
 class SAMInference:

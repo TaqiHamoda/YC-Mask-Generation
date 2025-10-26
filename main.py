@@ -2,9 +2,9 @@ import numpy as np
 import cv2, os, tqdm, gc, yaml
 from typing import Tuple
 
-from .annotations import Annotations
-from .colormap import Colormap
-from .SAMInference import SAMInference
+from annotations import Annotations
+from colormap import Colormap
+from SAMInference import SAMInference
 
 
 def filter_and_color_mask(
@@ -60,32 +60,36 @@ if __name__ == '__main__':
     min_mask_area_default = config.get('min_mask_area_default', 2000)
     point_generation_candidates = config.get('point_generation_candidates', 2000)
     annotations_file = config.get('annotations_file', 'annotations.csv')
-    colormap_file = config.get('colormap_file', 'colormap.csv')
+    colormap_path = config.get('colormap_path', 'colormap.csv')
     images_dir = config.get('images_dir', 'images/')
-    checkpoint_file = config.get('checkpoint_file', 'checkpoint.pth')
+    checkpoint_path = config.get('checkpoint_path', 'checkpoint.pth')
     output_dir = config.get('output_dir', 'masks/')
 
     dirs = config.get('dirs', [])
 
     for d in dirs:
+        print(f"Processing {d}")
+
         # 💡 Create output directory if it doesn't exist
         os.makedirs(f"{d}/{output_dir}", exist_ok=True)
 
         # Initialize the inference engine
         sam_model = SAMInference(
-            checkpoint_path=f"{d}/{checkpoint_file}",
-            color_map=Colormap(f"{d}/{colormap_file}"),
+            checkpoint_path=checkpoint_path,
+            colormap=Colormap(colormap_path),
             model_type=model_type,
             device=default_device,
             point_generation_candidates=point_generation_candidates
         )
 
         # 💡 Initialize Annotations using the config path
-        annotations = Annotations(annotations_file)
+        annotations = Annotations(f"{d}/{annotations_file}")
+
+        print("Finished parsing annotations")
         
         # 💡 Fix the iteration: use keys (image_name) instead of values
         for image_name in tqdm.tqdm(annotations.data.keys()):
-            image_path = f"{d}/{images_dir}/{image_name}"
+            image_path = f"{d}/{images_dir}/{image_name}.jpg"
             if not os.path.exists(image_path) or not os.path.isfile(image_path):
                 print(f"Image {image_name} not found.")
                 continue
@@ -116,12 +120,12 @@ if __name__ == '__main__':
                 continue
 
             cv2.imwrite(
-                f"{d}/{output_dir}/{image_name.split('.')[:-1]}_color.png",
+                f"{d}/{output_dir}/{image_name}.png",
                 cv2.cvtColor(mask, cv2.COLOR_RGB2BGR)
             )
 
             cv2.imwrite(
-                f"{d}/{output_dir}/{image_name.split('.')[:-1]}_overlay.png",
+                f"{d}/{output_dir}/{image_name}_overlay.jpg",
                 cv2.cvtColor(cv2.addWeighted(image, 1, mask, 0.6, 0), cv2.COLOR_RGB2BGR)
             )
 
